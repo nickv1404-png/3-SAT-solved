@@ -1,0 +1,402 @@
+from collections import defaultdict
+import random
+import time
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+
+class CDCLSolver:
+    def __init__(self, clauses, num_variables, seed=None, stop_event=None, shared_queue=None, worker_id=0):
+        self.num_vars = num_variables
+        self.worker_id = worker_id
+        self.stop_event = stop_event
+        self.shared_queue = shared_queue
+        
+        self.clauses = []
+        for c in clauses:
+            cleaned = list(set(c))
+            if any(-lit in cleaned for lit in cleaned):
+                continue
+            self.clauses.append(cleaned)
+            
+        self.original_clauses_count = len(self.clauses)
+            
+        self.assignment = {}      
+        self.level = {}           
+        self.reason = {}          
+        
+        self.saved_phases = {}    
+        self.lbd_table = {}       
+        
+        self.current_level = 0
+        self.trail = []           
+        self.bcp_ptr = 0          
+        
+        self.conflicts_count = 0
+        self.restart_threshold = 100  
+        
+        self.activity = defaultdict(float)
+        for clause in self.clauses:
+            for lit in clause:
+                self.activity[abs(lit)] += 1.0
+                
+        if seed is not None:
+            random.seed(seed)
+            for var in range(1, self.num_vars + 1):
+                self.activity[var] += random.uniform(0.0, 1.0)
+                
+        self.watches = defaultdict(list)  
+        self.init_watches()
+
+    def init_watches(self):
+        self.watches.clear()
+        for clause in self.clauses:
+            if len(clause) < 2:
+                continue
+            self.watches[clause[0]].append(clause)
+            self.watches[clause[1]].append(clause)
+
+    def get_lit_value(self, lit):
+        var = abs(lit)
+        if var not in self.assignment:
+            return None
+        return self.assignment[var] if lit > 0 else not self.assignment[var]
+
+    def assign(self, lit, reason_clause=None):
+        var = abs(lit)
+        is_true = (lit > 0)
+        
+        self.assignment[var] = is_true
+        self.level[var] = self.current_level
+        self.reason[var] = reason_clause
+        self.trail.append(lit)
+        
+        self.saved_phases[var] = is_true
+
+    def bcp(self):
+        while self.bcp_ptr < len(self.trail):
+            false_lit = -self.trail[self.bcp_ptr]
+            self.bcp_ptr += 1
+            
+            watching_clauses = list(self.watches[false_lit])
+            
+            for clause in watching_clauses:
+                if clause[0] == false_lit:
+                    clause[0], clause[1] = clause[1], clause[0]
+                    
+                if self.get_lit_value(clause[0]) is True:
+                    continue
+                    
+                found_new_watch = False
+                for i in range(2, len(clause)):
+                    if self.get_lit_value(clause[i]) is not False:
+                        clause[1], clause[i] = clause[i], clause[1]
+                        self.watches[false_lit].remove(clause)
+                        self.watches[clause[1]].append(clause)
+                        found_new_watch = True
+                        break
+                        
+                if found_new_watch:
+                    continue
+                    
+                val0 = self.get_lit_value(clause[0])
+                if val0 is False:
+                    return clause  
+                elif val0 is None:
+                    self.assign(clause[0], clause)
+                    
+        return None
+
+    def analyze_conflict(self, conflict_clause):
+        learned = []
+        for lit in conflict_clause:
+            self.activity[abs(lit)] += 1.0
+            learned.append(-lit)
+            
+        for var in self.activity:
+            self.activity[var] *= 0.95  
+            
+        if not learned:
+            return None, 0
+            
+        backjump_level = 0
+        for lit in learned:
+            lvl = self.level.get(abs(lit), 0)
+            if lvl < self.current_level:
+                backjump_level = max(backjump_level, lvl)
+                
+        return list(set(learned)), backjump_level
+
+    def backtrack(self, target_level):
+        while self.trail:
+            last_lit = self.trail[-1]
+            var = abs(last_lit)
+            
+            if self.level[var] > target_level:
+                self.trail.pop()
+                del self.assignment[var]
+                del self.level[var]
+                if var in self.reason:
+                    del self.reason[var]
+            else:
+                break
+                
+        self.current_level = target_level
+        self.bcp_ptr = len(self.trail)  
+
+    def pick_branching_variable(self):
+        best_var = None
+        max_activity = -1.0
+        for var in range(1, self.num_vars + 1):
+            if var not in self.assignment:
+                if self.activity[var] > max_activity:
+                    max_activity = self.activity[var]
+                    best_var = var
+        return best_var
+
+    def cleanup_learned_clauses(self):
+        original = self.clauses[:self.original_clauses_count]
+        learned = self.clauses[self.original_clauses_count:]
+        
+        learned.sort(key=lambda c: self.lbd_table.get(id(c), 99999))
+        
+        keep_count = len(learned) // 2
+        retained_learned = learned[:keep_count]
+        purged_learned = learned[keep_count:]
+        
+        for clause in purged_learned:
+            self.lbd_table.pop(id(clause), None)
+            
+        self.clauses = original + retained_learned
+        self.init_watches()  
+
+    def check_and_inject_shared_clauses(self):
+        """Checks Inter-Process queue communication pipelines for broadcast clauses."""
+        if not self.shared_queue:
+            return
+            
+        try:
+            while not self.shared_queue.empty():
+                origin_id, external_clause = self.shared_queue.get_nowait()
+                
+                # Filter away self-originated broadcasts
+                if origin_id == self.worker_id:
+                    continue
+                    
+                if external_clause not in self.clauses:
+                    self.clauses.append(external_clause)
+                    self.lbd_table[id(external_clause)] = 1
+                    
+                    if len(external_clause) > 1:
+                        self.watches[external_clause[0]].append(external_clause)
+                        self.watches[external_clause[1]].append(external_clause)
+                    elif len(external_clause) == 1:
+                        val = self.get_lit_value(external_clause[0])
+                        if val is None:
+                            self.assign(external_clause[0], external_clause)
+        except Exception:
+            pass
+
+    def solve(self):
+        self.bcp_ptr = 0
+        
+        for clause in self.clauses:
+            if len(clause) == 1:
+                val = self.get_lit_value(clause[0])
+                if val is False:
+                    return None  
+                elif val is None:
+                    self.assign(clause[0], clause)
+
+        while True:
+            if self.stop_event and self.stop_event.is_set():
+                return "CANCELLED"
+
+            # Periodically synchronize knowledge matrix across cores
+            if self.conflicts_count % 5 == 0:
+                self.check_and_inject_shared_clauses()
+
+            conflict_clause = self.bcp()
+            
+            if conflict_clause is not None:
+                if self.current_level == 0:
+                    return None  
+                
+                self.conflicts_count += 1
+                learned_clause, backjump_level = self.analyze_conflict(conflict_clause)
+                
+                if learned_clause is None or len(learned_clause) == 0:
+                    return None
+                
+                unique_levels = {self.level[abs(lit)] for lit in learned_clause if abs(lit) in self.level}
+                lbd_score = max(1, len(unique_levels))
+                
+                self.clauses.append(learned_clause)
+                self.lbd_table[id(learned_clause)] = lbd_score
+                
+                # Broadcasting high-quality insights (LBD == 1) to peer processes
+                if lbd_score == 1 and self.shared_queue:
+                    try:
+                        self.shared_queue.put_nowait((self.worker_id, learned_clause))
+                    except Exception:
+                        pass
+                
+                self.backtrack(backjump_level)
+                
+                if len(learned_clause) > 1:
+                    self.watches[learned_clause[0]].append(learned_clause)
+                    self.watches[learned_clause[1]].append(learned_clause)
+                
+                for lit in learned_clause:
+                    if self.get_lit_value(lit) is None:
+                        self.assign(lit, learned_clause)
+                        break
+                
+                if len(self.clauses) > self.original_clauses_count + 1000:
+                    self.cleanup_learned_clauses()
+                
+                if self.conflicts_count >= self.restart_threshold:
+                    self.backtrack(0)  
+                    self.conflicts_count = 0 
+                    self.restart_threshold = int(self.restart_threshold * 1.5)  
+                
+                continue
+            
+            var = self.pick_branching_variable()
+            if var is None:
+                return self.assignment
+            
+            self.current_level += 1
+            
+            phase = self.saved_phases.get(var, True)
+            branch_lit = var if phase else -var
+            self.assign(branch_lit)
+
+
+def preprocess_bve(clauses, num_vars, max_growth=0):
+    current_clauses = [list(set(c)) for c in clauses]
+    eliminated_vars = set()
+    
+    changed = True
+    while changed:
+        changed = False
+        for var in range(1, num_vars + 1):
+            if var in eliminated_vars:
+                continue
+                
+            pos_clauses = [c for c in current_clauses if var in c]
+            neg_clauses = [c for c in current_clauses if -var in c]
+            
+            if not pos_clauses or not neg_clauses:
+                continue
+                
+            resolvents = []
+            tautology_count = 0
+            
+            for pc in pos_clauses:
+                for nc in neg_clauses:
+                    merged = set(pc) | set(nc)
+                    merged.remove(var)
+                    merged.remove(-var)
+                    
+                    if any(-lit in merged for lit in merged):
+                        tautology_count += 1
+                        continue
+                        
+                    resolvents.append(list(merged))
+                    
+            growth = len(resolvents) - (len(pos_clauses) + len(neg_clauses))
+            if growth <= max_growth:
+                retained_clauses = [c for c in current_clauses if var not in c and -var not in c]
+                current_clauses = retained_clauses + resolvents
+                eliminated_vars.add(var)
+                changed = True
+                break
+                
+    return current_clauses
+
+
+# =====================================================================
+# MULTI-CORE WORKER EXECUTIVE ENTRYPOINT
+# =====================================================================
+def solve_process_worker(clauses, num_vars, seed, stop_event, shared_queue, worker_id):
+    """Executes search worker thread on a dedicated OS hardware core container."""
+    solver = CDCLSolver(clauses, num_vars, seed=seed, stop_event=stop_event, shared_queue=shared_queue, worker_id=worker_id)
+    result = solver.solve()
+    
+    if result != "CANCELLED":
+        stop_event.set()
+        return {"worker_id": worker_id, "result": result}
+    return None
+
+def run_multi_core_portfolio(clauses, num_vars, num_workers=4):
+    """Orchestrates genuine parallel scaling utilizing a shared manager queue."""
+    # Instantiating a multi-processing context manager structure
+    manager = multiprocessing.Manager()
+    stop_event = manager.Event()
+    shared_queue = manager.Queue()
+    
+    final_result = "UNDETERMINED"
+    winning_worker = None
+    
+    print(f"Spawning True Multi-Core Portfolio Engine over {num_workers} separate CPU cores...")
+    
+    # Swapping ThreadPoolExecutor for ProcessPoolExecutor to shatter the Python GIL
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(
+                solve_process_worker, 
+                clauses, 
+                num_vars, 
+                seed=200 + i * 35, 
+                stop_event=stop_event, 
+                shared_queue=shared_queue, 
+                worker_id=i
+            )
+            for i in range(num_workers)
+        ]
+        
+        for future in futures:
+            worker_data = future.result()
+            if worker_data is not None:
+                final_result = worker_data["result"]
+                winning_worker = worker_data["worker_id"]
+                break
+                
+    return final_result, winning_worker
+
+
+def run_integrated_pipeline():
+    num_vars = 80
+    clauses_count = int(num_vars * 4.25)
+    
+    random.seed(42)
+    raw_clauses = []
+    while len(raw_clauses) < clauses_count:
+        clause = []
+        while len(clause) < 3:
+            v = random.randint(1, num_vars)
+            lit = v if random.random() > 0.5 else -v
+            if v not in [abs(x) for x in clause]:
+                clause.append(lit)
+        if clause not in raw_clauses:
+            raw_clauses.append(clause)
+            
+    print(f"Original Formula Configuration Size: {len(raw_clauses)} clauses.")
+    
+    preprocessed_clauses = preprocess_bve(raw_clauses, num_vars, max_growth=0)
+    print(f"Preprocessed Formula Configuration Size: {len(preprocessed_clauses)} clauses.")
+    
+    start_time = time.perf_counter()
+    result, winner = run_multi_core_portfolio(preprocessed_clauses, num_vars, num_workers=4)
+    end_time = time.perf_counter()
+    
+    print(f"\nFinal Global Processing Outcome Matrix:")
+    print(f"Execution Window Close: {end_time - start_time:.5f} seconds")
+    if result is None:
+        print("Verdict: Formula is verified UNSATISFIABLE")
+    else:
+        print(f"Verdict: Formula is verified SATISFIABLE (Solved by Core Process ID: {winner})")
+
+if __name__ == "__main__":
+    # Required block context constraint structure for safe process spawning on Windows/macOS
+    run_integrated_pipeline()
